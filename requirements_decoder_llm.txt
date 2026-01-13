@@ -1,0 +1,40 @@
+# Requirements for Decoder-only LLM Mode Connectivity Analysis
+
+# Core dependencies
+torch>=2.0.0
+transformers>=4.35.0
+datasets>=2.14.0
+tokenizers>=0.13.0
+
+# Training and optimization
+accelerate>=0.24.0
+bitsandbytes>=0.41.0
+peft>=0.6.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Evaluation
+tqdm>=4.65.0
+scikit-learn>=1.3.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Utilities
+wandb>=0.15.0  # Optional: for experiment tracking
+tensorboard>=2.13.0  # Optional: for logging
+
+# Model-specific
+sentencepiece>=0.1.99  # For Llama tokenizer
+tiktoken>=0.5.0  # For some tokenizers
+
+# Testing (optional)
+pytest>=7.4.0
+pytest-cov>=4.1.0
