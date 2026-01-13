@@ -1,130 +1,109 @@
 """
-Trainer for decoder-only LLMs with reasoning benchmarks.
-Supports:
-- Supervised fine-tuning (SFT)
-- Mode connectivity analysis
-- Reasoning evaluation (GSM8K, MATH)
+Decoder LLM Trainer for Mode Connectivity Analysis
+Based on T5_trainer.py structure, adapted for causal LLMs (Qwen, Llama)
 """
 
 import os
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from transformers import get_linear_schedule_with_warmup
-from tqdm import tqdm
 import numpy as np
+import torch
+import random
+import warnings
 import json
-from typing import Dict, Optional, List, Tuple
-from pathlib import Path
+from collections import OrderedDict
+from transformers import (
+    AdamW,
+    get_linear_schedule_with_warmup,
+    is_torch_available,
+)
+from torch.utils.tensorboard import SummaryWriter
 
-from .modeling_decoder_llm import DecoderLLMWithPET
-from .chat_template import ChatTemplateHandler
-from .reasoning_metrics import ReasoningMetrics
+warnings.filterwarnings("ignore")
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    if is_torch_available():
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 class DecoderLLMTrainer:
     """
     Trainer for decoder-only LLMs on reasoning tasks.
+    Follows the same structure as T5 Trainer for mode connectivity analysis.
     """
 
-    def __init__(
-        self,
-        model: DecoderLLMWithPET,
-        tokenizer,
-        chat_template_handler: ChatTemplateHandler,
-        train_dataloader: Optional[DataLoader] = None,
-        eval_dataloader: Optional[DataLoader] = None,
-        test_dataloader: Optional[DataLoader] = None,
-        learning_rate: float = 5e-5,
-        weight_decay: float = 0.01,
-        warmup_steps: int = 0,
-        max_grad_norm: float = 1.0,
-        device: str = "cuda",
-        output_dir: str = "./outputs",
-        logging_steps: int = 100,
-        eval_steps: int = 500,
-        save_steps: int = 1000,
-        max_steps: int = 10000,
-        gradient_accumulation_steps: int = 1,
-        fp16: bool = False,
-        bf16: bool = True,
-    ):
-        """
-        Args:
-            model: DecoderLLMWithPET instance
-            tokenizer: HuggingFace tokenizer
-            chat_template_handler: ChatTemplateHandler
-            train_dataloader: Training data loader
-            eval_dataloader: Evaluation data loader
-            test_dataloader: Test data loader
-            learning_rate: Learning rate
-            weight_decay: Weight decay
-            warmup_steps: Number of warmup steps
-            max_grad_norm: Max gradient norm for clipping
-            device: Device to train on
-            output_dir: Directory to save outputs
-            logging_steps: Log every N steps
-            eval_steps: Evaluate every N steps
-            save_steps: Save checkpoint every N steps
-            max_steps: Maximum training steps
-            gradient_accumulation_steps: Gradient accumulation steps
-            fp16: Use FP16 training
-            bf16: Use BF16 training
-        """
-        self.model = model
-        self.tokenizer = tokenizer
+    def __init__(self, args, logger, model_provider, chat_template_handler=None):
+        self.args = args
+        self.logger = logger
+
+        logger.info("Loading model ...")
+        self.model, self.config, self.tokenizer = model_provider(args)
+
+        # Create chat template handler if not provided
+        if chat_template_handler is None:
+            from .chat_template import ChatTemplateHandler
+            chat_template_handler = ChatTemplateHandler(args.model, self.tokenizer)
+
         self.chat_template_handler = chat_template_handler
-        self.train_dataloader = train_dataloader
-        self.eval_dataloader = eval_dataloader
-        self.test_dataloader = test_dataloader
 
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
-        self.max_grad_norm = max_grad_norm
-        self.device = device
-        self.output_dir = Path(output_dir)
-        self.logging_steps = logging_steps
-        self.eval_steps = eval_steps
-        self.save_steps = save_steps
-        self.max_steps = max_steps
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.fp16 = fp16
-        self.bf16 = bf16
+        logger.info("Loading Dataset ...")
+        # Import reasoning dataset loaders
+        from dataloader.reasoning.reasoning_loader import ReasoningData
 
-        # Create output directory
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.train_data = ReasoningData(
+            logger, args, args.dataset, split="train",
+            tokenizer=self.tokenizer, chat_handler=chat_template_handler
+        )
+        self.train_data.load_dataset()
+        self.train_data.load_dataloader()
 
-        # Move model to device
-        self.model.to(self.device)
+        self.dev_data = ReasoningData(
+            logger, args, args.dataset, split="test",
+            tokenizer=self.tokenizer, chat_handler=chat_template_handler
+        )
+        self.dev_data.load_dataset()
+        self.dev_data.load_dataloader()
 
-        # Setup optimizer and scheduler
-        self.optimizer = None
-        self.scheduler = None
-        if train_dataloader:
-            self._setup_optimizer()
+        self.test_data = self.dev_data  # For reasoning tasks, test = dev
 
-        # Mixed precision training
-        self.scaler = torch.cuda.amp.GradScaler() if fp16 else None
+        self.device = self.init_device()
+        self.model = self.model.to(self.device)
+        self.gradient_accumulation_steps = args.gradient_accumulation_steps
+        self.init_tensorboard(args)
 
-        # Training state
-        self.global_step = 0
-        self.best_eval_metric = 0.0
+        if args.seed is not None:
+            set_seed(args.seed)
 
-        print(f"Trainer initialized. Output directory: {self.output_dir}")
-        if hasattr(model, 'print_trainable_parameters'):
-            model.print_trainable_parameters()
+    def init_device(self):
+        if not torch.cuda.is_available():
+            print('No GPU available, using CPU')
+            return torch.device('cpu')
+        return torch.device('cuda')
 
-    def _setup_optimizer(self):
-        """Setup optimizer and learning rate scheduler"""
-        # Get trainable parameters
+    def init_tensorboard(self, args):
+        if args.tensorboard_dir:
+            self.summary_writer = SummaryWriter(log_dir=args.tensorboard_dir)
+        else:
+            self.summary_writer = None
+
+    def train(self):
+        """Training loop following T5 trainer structure"""
+        args = self.args
+        self.logger.info("***** Running training *****")
+        self.logger.info(f"  Num examples = {len(self.train_data.dataset)}")
+        self.logger.info(f"  Num Epochs = {args.train_epochs}")
+        self.logger.info(f"  Batch size = {args.train_batch_size}")
+        self.logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+
+        # Setup optimizer
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in self.model.named_parameters()
                           if p.requires_grad and not any(nd in n for nd in no_decay)],
-                "weight_decay": self.weight_decay,
+                "weight_decay": args.weight_decay,
             },
             {
                 "params": [p for n, p in self.model.named_parameters()
@@ -133,61 +112,26 @@ class DecoderLLMTrainer:
             },
         ]
 
-        self.optimizer = AdamW(optimizer_grouped_parameters, lr=self.learning_rate)
-
-        # Scheduler
-        self.scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=self.max_steps
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=args.warmup_steps,
+            num_training_steps=args.train_iters
         )
 
-    def train(self):
-        """Train the model"""
-        if self.train_dataloader is None:
-            raise ValueError("train_dataloader is required for training")
-
-        print(f"Starting training for {self.max_steps} steps...")
-
         self.model.train()
-        train_iterator = iter(self.train_dataloader)
-        total_loss = 0.0
-        log_loss = 0.0
+        num_updates = 0
+        best_metric = -1.0
+        early_stop = 0
 
-        progress_bar = tqdm(range(self.max_steps), desc="Training")
+        for epoch in range(args.train_epochs):
+            for batch_idx, batch in enumerate(self.train_data.dataloader):
+                # Move to device
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
 
-        for step in progress_bar:
-            # Get batch
-            try:
-                batch = next(train_iterator)
-            except StopIteration:
-                # Restart iterator
-                train_iterator = iter(self.train_dataloader)
-                batch = next(train_iterator)
-
-            # Move to device
-            input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            labels = batch.get("labels", input_ids).to(self.device)
-
-            # Forward pass with mixed precision
-            if self.bf16:
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels
-                    )
-                    loss = outputs.loss / self.gradient_accumulation_steps
-            elif self.fp16:
-                with torch.cuda.amp.autocast():
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels
-                    )
-                    loss = outputs.loss / self.gradient_accumulation_steps
-            else:
+                # Forward pass
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -195,300 +139,176 @@ class DecoderLLMTrainer:
                 )
                 loss = outputs.loss / self.gradient_accumulation_steps
 
-            # Backward pass
-            if self.fp16 and self.scaler:
-                self.scaler.scale(loss).backward()
-            else:
+                # Backward pass
                 loss.backward()
 
-            total_loss += loss.item()
-            log_loss += loss.item()
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    num_updates += 1
 
-            # Gradient accumulation
-            if (step + 1) % self.gradient_accumulation_steps == 0:
-                # Clip gradients
-                if self.fp16 and self.scaler:
-                    self.scaler.unscale_(self.optimizer)
+                    # Logging
+                    if num_updates % args.log_interval == 0:
+                        self.logger.info(f"Epoch {epoch}, Step {num_updates}, Loss: {loss.item():.4f}")
 
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.max_grad_norm
+                    # Validation
+                    if num_updates % args.valid_interval == 0:
+                        metrics = self.valid(epoch, num_updates)
+                        current_metric = sum(metrics.values()) / len(metrics)
+
+                        if current_metric > best_metric:
+                            best_metric = current_metric
+                            early_stop = 0
+                            self.save_checkpoint(f"{args.output_dir}/checkpoint-best.pt", epoch, num_updates)
+                        else:
+                            early_stop += 1
+
+                        if args.early_stop > 0 and early_stop >= args.early_stop:
+                            self.logger.info(f"Early stopping at step {num_updates}")
+                            return best_metric
+
+                    # Save checkpoint
+                    if args.output_interval and num_updates % args.output_interval == 0:
+                        self.save_checkpoint(f"{args.output_dir}/checkpoint@{num_updates}.pt", epoch, num_updates)
+
+                    if num_updates >= args.train_iters:
+                        break
+
+            if num_updates >= args.train_iters:
+                break
+
+        # Save final checkpoint
+        self.save_checkpoint(f"{args.output_dir}/checkpoint-last.pt", epoch, num_updates)
+        return best_metric
+
+    def valid(self, epoch=0, num_updates=0):
+        """Validation following T5 trainer structure"""
+        self.model.eval()
+        my_predictions = []
+        references = []
+
+        self.logger.info(f"Begin validation on {len(self.dev_data.dataset)} samples ...")
+
+        with torch.no_grad():
+            for batch in self.dev_data.dataloader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+
+                # Generate
+                generated_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=self.args.max_output_length,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
                 )
 
-                # Optimizer step
-                if self.fp16 and self.scaler:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
+                # Decode
+                gen_text = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                my_predictions.extend(gen_text)
+                references.extend(batch['answer'])
 
-                self.scheduler.step()
-                self.optimizer.zero_grad()
-                self.global_step += 1
+        # Evaluate
+        metrics = self.dev_data.evaluate(my_predictions, references)
 
-            # Logging
-            if (step + 1) % self.logging_steps == 0:
-                avg_loss = log_loss / self.logging_steps
-                progress_bar.set_postfix({
-                    "loss": f"{avg_loss:.4f}",
-                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"
-                })
-                log_loss = 0.0
-
-            # Evaluation
-            if (step + 1) % self.eval_steps == 0 and self.eval_dataloader:
-                print(f"\nEvaluating at step {self.global_step}...")
-                eval_metrics = self.evaluate(self.eval_dataloader)
-                print(f"Eval metrics: {eval_metrics}")
-
-                # Save best model
-                if eval_metrics.get("accuracy", 0) > self.best_eval_metric:
-                    self.best_eval_metric = eval_metrics["accuracy"]
-                    self.save_checkpoint("best_model")
-                    print(f"New best model saved! Accuracy: {self.best_eval_metric:.4f}")
-
-                self.model.train()
-
-            # Save checkpoint
-            if (step + 1) % self.save_steps == 0:
-                self.save_checkpoint(f"checkpoint-{self.global_step}")
-
-        print(f"\nTraining complete! Best eval accuracy: {self.best_eval_metric:.4f}")
-
-        # Final save
-        self.save_checkpoint("final_model")
-
-        return total_loss / self.max_steps
-
-    @torch.no_grad()
-    def evaluate(
-        self,
-        dataloader: DataLoader,
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        do_sample: bool = False,
-        num_return_sequences: int = 1,
-    ) -> Dict[str, float]:
-        """
-        Evaluate the model on reasoning tasks.
-
-        Args:
-            dataloader: DataLoader to evaluate on
-            max_new_tokens: Max tokens to generate
-            temperature: Sampling temperature
-            do_sample: Whether to use sampling
-            num_return_sequences: Number of sequences to generate (for voting)
-
-        Returns:
-            Dictionary of metrics
-        """
-        self.model.eval()
-
-        all_predictions = []
-        all_references = []
-
-        print(f"Evaluating on {len(dataloader)} batches...")
-
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            # Move to device
-            input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-
-            # Generate
-            generation_config = {
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "do_sample": do_sample,
-                "num_return_sequences": num_return_sequences,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "eos_token_id": self.tokenizer.eos_token_id,
-            }
-
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **generation_config
-            )
-
-            # Decode predictions
-            predictions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-
-            # Extract answers from predictions
-            for i, pred in enumerate(predictions):
-                # Remove the input prompt from prediction
-                if i < len(batch["question"]):
-                    pred_answer = self.chat_template_handler.extract_answer(pred)
-                    all_predictions.append(pred_answer)
-
-            # Get references
-            if "numerical_answer" in batch:
-                all_references.extend(batch["numerical_answer"])
-            elif "boxed_answer" in batch:
-                all_references.extend(batch["boxed_answer"])
-            elif "answer" in batch:
-                all_references.extend(batch["answer"])
-
-        # Compute metrics
-        # Determine dataset type
-        dataset_type = "gsm8k"  # Default
-        if hasattr(dataloader.dataset, '__class__'):
-            if "MATH" in dataloader.dataset.__class__.__name__:
-                dataset_type = "math"
-
-        metrics = ReasoningMetrics.evaluate_batch(
-            all_predictions,
-            all_references,
-            dataset_type=dataset_type
-        )
-
+        self.logger.info(f"Validation at epoch {epoch}, step {num_updates}: {metrics}")
+        self.model.train()
         return metrics
 
-    def save_checkpoint(self, checkpoint_name: str):
-        """Save model checkpoint"""
-        checkpoint_dir = self.output_dir / checkpoint_name
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    def itp_valid(self, x=0.0):
+        """
+        Interpolation validation - called during mode connectivity analysis
+        Similar to valid() but returns raw scores for analysis
+        """
+        self.model.eval()
+        my_predictions = []
+        references = []
 
-        # Save trainable parameters only (for PET)
-        if hasattr(self.model, 'get_trainable_parameters'):
-            trainable_params = self.model.get_trainable_parameters()
-            torch.save(trainable_params, checkpoint_dir / "trainable_params.pt")
-            print(f"Saved {len(trainable_params)} trainable parameters")
+        with torch.no_grad():
+            for batch in self.dev_data.dataloader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+
+                generated_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=self.args.max_output_length,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+
+                gen_text = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                my_predictions.extend(gen_text)
+                references.extend(batch['answer'])
+
+        # Evaluate
+        metrics, raw_scores = self.dev_data.itp_evaluate(my_predictions, references)
+
+        # Calculate performance (main metric)
+        metric_name = list(metrics.keys())[0]
+        performance = metrics[metric_name]
+
+        return metric_name, performance, 0.0, raw_scores  # metric, perf, loss, scores
+
+    def itp_test(self, args, model, x=0.0):
+        """Interpolation test - similar to itp_valid"""
+        return self.itp_valid(x=x)
+
+    def save_checkpoint(self, save_path, epoch, num_updates):
+        """Save checkpoint following T5 trainer structure"""
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+        # For PET methods, only save trainable parameters
+        if self.args.tune_method in ['lora', 'adapter']:
+            state_dict = {k: v for k, v in self.model.state_dict().items() if v.requires_grad}
+            checkpoint = {
+                self.args.tune_method: state_dict,
+                'epoch': epoch,
+                'num_updates': num_updates
+            }
         else:
-            # Save full model
-            torch.save(self.model.state_dict(), checkpoint_dir / "model.pt")
+            checkpoint = {
+                'model': self.model.state_dict(),
+                'epoch': epoch,
+                'num_updates': num_updates
+            }
 
-        # Save training state
-        training_state = {
-            "global_step": self.global_step,
-            "best_eval_metric": self.best_eval_metric,
-        }
-        if self.optimizer:
-            training_state["optimizer"] = self.optimizer.state_dict()
-        if self.scheduler:
-            training_state["scheduler"] = self.scheduler.state_dict()
+        torch.save(checkpoint, save_path)
+        self.logger.info(f"Checkpoint saved to {save_path}")
 
-        torch.save(training_state, checkpoint_dir / "training_state.pt")
+    def load_checkpoint(self, load_path):
+        """Load checkpoint"""
+        self.logger.info(f"Loading checkpoint from {load_path}")
+        checkpoint = torch.load(load_path, map_location=self.device)
 
-        # Save config
-        config_dict = {
-            "learning_rate": self.learning_rate,
-            "weight_decay": self.weight_decay,
-            "max_steps": self.max_steps,
-            "global_step": self.global_step,
-        }
-        with open(checkpoint_dir / "config.json", "w") as f:
-            json.dump(config_dict, f, indent=2)
+        if self.args.tune_method in checkpoint:
+            state_dict = checkpoint[self.args.tune_method]
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
 
-        print(f"Checkpoint saved to {checkpoint_dir}")
+        model_dict = self.model.state_dict()
+        model_dict.update(state_dict)
+        self.model.load_state_dict(model_dict)
 
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint"""
-        checkpoint_path = Path(checkpoint_path)
+    def add_logging(self, log_dict, key, value):
+        """Add value to logging dict"""
+        if key not in log_dict:
+            log_dict[key] = []
+        log_dict[key].append(value)
 
-        # Load trainable parameters
-        if (checkpoint_path / "trainable_params.pt").exists():
-            trainable_params = torch.load(checkpoint_path / "trainable_params.pt")
-            if hasattr(self.model, 'load_trainable_parameters'):
-                self.model.load_trainable_parameters(trainable_params)
-            print(f"Loaded trainable parameters from {checkpoint_path}")
-        elif (checkpoint_path / "model.pt").exists():
-            self.model.load_state_dict(torch.load(checkpoint_path / "model.pt"))
-            print(f"Loaded full model from {checkpoint_path}")
+    def log_step(self, log_dict, suffix="", tensorboard_suffix='', epoch=0, num_updates=0, **kwargs):
+        """Log step information"""
+        loss = np.mean(log_dict.get('loss', [0]))
+        msg = f"{suffix} Epoch {epoch}, Step {num_updates}, Loss: {loss:.4f}"
 
-        # Load training state
-        if (checkpoint_path / "training_state.pt").exists():
-            training_state = torch.load(checkpoint_path / "training_state.pt")
-            self.global_step = training_state.get("global_step", 0)
-            self.best_eval_metric = training_state.get("best_eval_metric", 0.0)
+        for k, v in kwargs.items():
+            msg += f", {k}: {v:.4f}"
 
-            if self.optimizer and "optimizer" in training_state:
-                self.optimizer.load_state_dict(training_state["optimizer"])
-            if self.scheduler and "scheduler" in training_state:
-                self.scheduler.load_state_dict(training_state["scheduler"])
-
-            print(f"Loaded training state: step={self.global_step}, best_metric={self.best_eval_metric:.4f}")
-
-    @torch.no_grad()
-    def interpolate_evaluate(
-        self,
-        checkpoint_path_1: str,
-        checkpoint_path_2: str,
-        dataloader: DataLoader,
-        num_points: int = 11,
-        save_results: bool = True,
-    ) -> Dict:
-        """
-        Perform mode connectivity analysis between two checkpoints.
-        Linearly interpolate between two models and evaluate at each point.
-
-        Args:
-            checkpoint_path_1: Path to first checkpoint
-            checkpoint_path_2: Path to second checkpoint
-            dataloader: DataLoader for evaluation
-            num_points: Number of interpolation points
-            save_results: Whether to save results
-
-        Returns:
-            Dictionary with interpolation results
-        """
-        print(f"\n{'='*60}")
-        print("MODE CONNECTIVITY ANALYSIS")
-        print(f"{'='*60}")
-        print(f"Checkpoint 1: {checkpoint_path_1}")
-        print(f"Checkpoint 2: {checkpoint_path_2}")
-        print(f"Interpolation points: {num_points}")
-        print(f"{'='*60}\n")
-
-        # Load checkpoints
-        checkpoint_1 = torch.load(Path(checkpoint_path_1) / "trainable_params.pt")
-        checkpoint_2 = torch.load(Path(checkpoint_path_2) / "trainable_params.pt")
-
-        # Interpolation coefficients
-        alphas = np.linspace(0, 1, num_points)
-
-        results = {
-            "alphas": alphas.tolist(),
-            "accuracies": [],
-            "losses": [],
-        }
-
-        for alpha in alphas:
-            print(f"\nEvaluating at α = {alpha:.2f}")
-
-            # Interpolate parameters
-            interpolated_params = {}
-            for key in checkpoint_1.keys():
-                if key in checkpoint_2:
-                    interpolated_params[key] = (
-                        (1 - alpha) * checkpoint_1[key] + alpha * checkpoint_2[key]
-                    )
-
-            # Load interpolated parameters
-            if hasattr(self.model, 'load_trainable_parameters'):
-                self.model.load_trainable_parameters(interpolated_params)
-
-            # Evaluate
-            metrics = self.evaluate(dataloader, do_sample=False)
-
-            results["accuracies"].append(metrics.get("accuracy", 0.0))
-            print(f"Accuracy at α={alpha:.2f}: {metrics.get('accuracy', 0.0):.4f}")
-
-        # Save results
-        if save_results:
-            results_path = self.output_dir / "interpolation_results.json"
-            with open(results_path, "w") as f:
-                json.dump(results, f, indent=2)
-            print(f"\nResults saved to {results_path}")
-
-        # Print summary
-        print(f"\n{'='*60}")
-        print("INTERPOLATION SUMMARY")
-        print(f"{'='*60}")
-        print(f"Endpoint 1 (α=0.0): {results['accuracies'][0]:.4f}")
-        print(f"Endpoint 2 (α=1.0): {results['accuracies'][-1]:.4f}")
-        print(f"Max accuracy: {max(results['accuracies']):.4f}")
-        print(f"Min accuracy: {min(results['accuracies']):.4f}")
-        print(f"Mean accuracy: {np.mean(results['accuracies']):.4f}")
-        print(f"{'='*60}\n")
-
-        return results
+        self.logger.info(msg)
+        return loss

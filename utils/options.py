@@ -98,6 +98,20 @@ class option:
         parser.add_argument('--cartography', action='store_true')
         parser.add_argument('--itp_on_train', action='store_true')
 
+        # For decoder-only LLMs (Qwen, Llama, etc.)
+        parser.add_argument("--lora_rank", type=int, default=8,
+                           help="LoRA rank for parameter-efficient tuning")
+        parser.add_argument("--lora_alpha", type=int, default=16,
+                           help="LoRA alpha (scaling factor)")
+        parser.add_argument("--bf16", action='store_true', default=False,
+                           help="Use BF16 mixed precision")
+        parser.add_argument("--cache_dir", type=str, default=None,
+                           help="Cache directory for models and datasets")
+        parser.add_argument("--eval_batch_size", type=int, default=8,
+                           help="Batch size for evaluation")
+        parser.add_argument("--tensorboard_dir", type=str, default=None,
+                           help="TensorBoard logging directory")
+
         self.parser = parser
 
     def parse(self):
