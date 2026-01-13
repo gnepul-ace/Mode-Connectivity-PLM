@@ -88,9 +88,16 @@ class option:
         parser.add_argument("--r_std", type=float, default=0.02)
 
         # For interpolation
-        parser.add_argument("--load_PET_path_1", type=str)
-        parser.add_argument("--load_PET_path_2", type=str)
-        parser.add_argument("--itpl_points", type=int, default=26)
+        parser.add_argument("--load_PET_path_1", type=str,
+                           help="[Deprecated] Path to first checkpoint (use --model_path_1)")
+        parser.add_argument("--load_PET_path_2", type=str,
+                           help="[Deprecated] Path to second checkpoint (use --model_path_2)")
+        parser.add_argument("--model_path_1", type=str, default=None,
+                           help="First model: local checkpoint file or HuggingFace model ID")
+        parser.add_argument("--model_path_2", type=str, default=None,
+                           help="Second model: local checkpoint file or HuggingFace model ID")
+        parser.add_argument("--itpl_points", type=int, default=26,
+                           help="Number of interpolation points between models")
 
         # For special settings
         parser.add_argument("--SGD_noise", action='store_true')

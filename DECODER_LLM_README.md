@@ -22,14 +22,18 @@ pip install torch transformers datasets pandas numpy matplotlib
 
 ### 2. Mode Connectivity分析（Full Parameter模型）
 
-**最常见的用法 - 完整参数模型**：
+**支持两种模型来源**：
+1. 本地checkpoint文件（.pt, .pth, .bin）
+2. HuggingFace模型ID（username/model-name）
+
+#### 示例1：两个本地checkpoint
 
 ```bash
 python decoder_interpolation.py \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --dataset gsm8k \
-  --load_PET_path_1 ./model1/checkpoint.pt \
-  --load_PET_path_2 ./model2/checkpoint.pt \
+  --model_path_1 ./model1/checkpoint.pt \
+  --model_path_2 ./model2/checkpoint.pt \
   --itpl_points 11 \
   --output_dir ./outputs/connectivity \
   --max_input_length 512 \
@@ -37,7 +41,34 @@ python decoder_interpolation.py \
   --eval_batch_size 8
 ```
 
-**注意**：不需要指定`--tune_method`，默认就是full parameter模式！
+#### 示例2：两个HuggingFace模型
+
+```bash
+python decoder_interpolation.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset gsm8k \
+  --model_path_1 username/qwen-model-rl1 \
+  --model_path_2 username/qwen-model-rl2 \
+  --itpl_points 11 \
+  --output_dir ./outputs/connectivity
+```
+
+#### 示例3：混合（本地 + HuggingFace）
+
+```bash
+python decoder_interpolation.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset math \
+  --model_path_1 ./local_checkpoint.pt \
+  --model_path_2 username/hf-finetuned-model \
+  --itpl_points 21 \
+  --output_dir ./outputs/connectivity
+```
+
+**注意**：
+- 不需要指定`--tune_method`，默认就是full parameter模式！
+- `--model`参数指定基础模型架构（用于初始化tokenizer和配置）
+- `--load_PET_path_1/2`已弃用，请使用`--model_path_1/2`
 
 ### 3. 评估单个模型
 
