@@ -1,39 +1,35 @@
 # Mode Connectivity Analysis for Decoder-Only LLMs
 
-**专注于分析** - 无需训练，直接使用已训练好的模型进行mode connectivity分析。
+**专注于分析** - 直接使用已训练好的模型（full parameter或PET）进行mode connectivity分析。
 
 ## 核心功能
 
+✅ **支持完整参数模型** (Full Parameter) - 最常用！
 ✅ **直接从HuggingFace加载模型**
 ✅ **支持reasoning benchmarks** (GSM8K, MATH)
 ✅ **Mode connectivity分析** (线性插值)
 ✅ **正确的chat template处理** (关键!)
-✅ **支持多种checkpoint格式** (LoRA, Adapter, Full model)
+✅ **灵活的checkpoint加载** (自动检测格式)
 
 ## 快速开始
 
 ### 1. 安装依赖
 
 ```bash
-pip install torch transformers datasets peft pandas numpy matplotlib
+pip install torch transformers datasets pandas numpy matplotlib
+# 如果使用LoRA: pip install peft
 ```
 
-### 2. 准备模型
+### 2. Mode Connectivity分析（Full Parameter模型）
 
-你可以：
-- 从HuggingFace下载已训练好的模型
-- 使用其他repo训练的模型checkpoint
-- 使用RL训练（DAPO/DR GRPO等）得到的checkpoint
-
-### 3. Mode Connectivity分析
+**最常见的用法 - 完整参数模型**：
 
 ```bash
 python decoder_interpolation.py \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --dataset gsm8k \
-  --tune_method lora \
-  --load_PET_path_1 ./checkpoints/model1_lora.pt \
-  --load_PET_path_2 ./checkpoints/model2_lora.pt \
+  --load_PET_path_1 ./model1/checkpoint.pt \
+  --load_PET_path_2 ./model2/checkpoint.pt \
   --itpl_points 11 \
   --output_dir ./outputs/connectivity \
   --max_input_length 512 \
@@ -41,69 +37,138 @@ python decoder_interpolation.py \
   --eval_batch_size 8
 ```
 
-### 4. 单独评估一个模型
+**注意**：不需要指定`--tune_method`，默认就是full parameter模式！
+
+### 3. 评估单个模型
 
 ```bash
 python evaluate_decoder_llm.py \
   --model Qwen/Qwen2.5-0.5B-Instruct \
   --dataset gsm8k \
-  --checkpoint ./checkpoints/model_lora.pt \
-  --output_dir ./outputs/eval \
-  --max_input_length 512 \
-  --max_output_length 512
+  --checkpoint ./your_model/checkpoint.pt \
+  --output_dir ./outputs/eval
 ```
 
 ## 支持的Checkpoint格式
 
-脚本会自动识别以下格式：
+代码会**自动检测**以下格式（按优先级）：
 
-### LoRA weights
+### 1. 直接State Dict（最常见，Full Parameter）
 ```python
 {
-  'lora': {
-    'base_model.model.layers.0.self_attn.q_proj.lora_A': tensor(...),
-    'base_model.model.layers.0.self_attn.q_proj.lora_B': tensor(...),
-    ...
-  }
+  'model.layers.0.self_attn.q_proj.weight': tensor(...),
+  'model.layers.0.self_attn.k_proj.weight': tensor(...),
+  ...
 }
 ```
 
-### Adapter weights
-```python
-{
-  'adapter': {
-    'layers.0.attn_adapter.adapter_A': tensor(...),
-    'layers.0.attn_adapter.adapter_B': tensor(...),
-    ...
-  }
-}
-```
+**这是最常见的格式！** 直接保存`model.state_dict()`的结果。
 
-### Full model
+### 2. 包装在'model'或'state_dict'键中
 ```python
 {
   'model': {
+    'model.layers.0.self_attn.q_proj.weight': tensor(...),
+    ...
+  },
+  'optimizer': {...},  # 可选
+  'epoch': 10,         # 可选
+}
+```
+
+或：
+```python
+{
+  'state_dict': {
     'model.layers.0.self_attn.q_proj.weight': tensor(...),
     ...
   }
 }
 ```
 
-### 直接state dict
+### 3. LoRA weights（如果使用）
 ```python
 {
-  'model.layers.0.self_attn.q_proj.weight': tensor(...),
-  ...
+  'lora': {
+    'base_model.model.layers.0.self_attn.q_proj.lora_A': tensor(...),
+    ...
+  }
 }
+```
+
+### 4. Adapter weights（如果使用）
+```python
+{
+  'adapter': {
+    'layers.0.attn_adapter.adapter_A': tensor(...),
+    ...
+  }
+}
+```
+
+**代码会自动尝试所有格式，你不需要担心！**
+
+## 实际使用示例
+
+### 示例1：分析RL训练前后的模型（Full Parameter）
+
+```bash
+# 你有两个完整参数的checkpoint
+python decoder_interpolation.py \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --dataset gsm8k \
+  --load_PET_path_1 ./checkpoints/before_rl.pt \
+  --load_PET_path_2 ./checkpoints/after_rl.pt \
+  --itpl_points 21 \
+  --output_dir ./results/rl_analysis
+```
+
+### 示例2：比较不同训练seed的模型
+
+```bash
+python decoder_interpolation.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset math \
+  --load_PET_path_1 ./checkpoints/seed_42.pt \
+  --load_PET_path_2 ./checkpoints/seed_123.pt \
+  --itpl_points 11 \
+  --output_dir ./results/seed_comparison
+```
+
+### 示例3：分析不同训练阶段
+
+```bash
+python decoder_interpolation.py \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --dataset gsm8k \
+  --load_PET_path_1 ./checkpoints/epoch_1.pt \
+  --load_PET_path_2 ./checkpoints/epoch_5.pt \
+  --itpl_points 11 \
+  --output_dir ./results/training_stages
+```
+
+### 示例4：使用LoRA checkpoint（如果你有）
+
+```bash
+python decoder_interpolation.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset gsm8k \
+  --tune_method lora \
+  --load_PET_path_1 ./lora_checkpoints/model1.pt \
+  --load_PET_path_2 ./lora_checkpoints/model2.pt \
+  --itpl_points 11 \
+  --output_dir ./results/lora_analysis
 ```
 
 ## 支持的模型
 
-### Qwen系列
+### Qwen系列（推荐）
 ```bash
 --model Qwen/Qwen2.5-0.5B-Instruct
 --model Qwen/Qwen2.5-1.5B-Instruct
 --model Qwen/Qwen2.5-7B-Instruct
+--model Qwen/Qwen2.5-14B-Instruct
+--model Qwen/Qwen2.5-32B-Instruct
 ```
 
 ### Llama系列
@@ -113,26 +178,34 @@ python evaluate_decoder_llm.py \
 --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
-**注意**: Llama模型需要HuggingFace认证:
+**注意**: Llama模型需要HuggingFace认证：
 ```bash
 huggingface-cli login
 ```
 
+### 其他Instruct模型
+理论上支持任何HuggingFace上的instruct模型，只要它：
+- 是decoder-only架构
+- 有对应的tokenizer
+- 支持`generate()`方法
+
 ## 支持的数据集
 
 ### GSM8K (Grade School Math)
-- 8,500道小学数学题
-- 需要2-8步推理
-- 评估：数值精确匹配
+- **简介**: 8,500道小学数学题
+- **难度**: 2-8步推理
+- **格式**: 答案格式为 `#### 数字`
+- **评估**: 数值精确匹配
 
 ```bash
 --dataset gsm8k
 ```
 
 ### MATH (Competition Mathematics)
-- 12,500道竞赛数学题
-- AMC/AIME难度
-- 评估：提取答案精确匹配
+- **简介**: 12,500道竞赛数学题
+- **难度**: AMC/AIME级别
+- **格式**: 答案在`\boxed{}`中
+- **评估**: 提取答案后精确匹配
 
 ```bash
 --dataset math
@@ -140,7 +213,7 @@ huggingface-cli login
 
 ## Chat Template的重要性 ⚠️
 
-**不同模型需要不同的chat format！** 使用错误的模板会严重影响性能。
+**不同模型需要不同的chat format！** 这对推理性能**至关重要**！
 
 ### Qwen格式
 ```
@@ -166,188 +239,257 @@ Let's think step by step.<|eot_id|>
 <|start_header_id|>assistant<|end_header_id|>
 ```
 
-**好消息**: `ChatTemplateHandler`会自动检测模型类型并使用正确的格式！
+**好消息**: `ChatTemplateHandler`会**自动检测**模型类型并使用正确格式 + 添加CoT提示词！
 
-## 关键参数说明
+## 关键参数
 
-### 模型相关
+### 基本参数（必需）
 ```bash
---model <model_name>          # HuggingFace model ID
---tune_method lora            # lora, adapter, or model
---checkpoint <path>           # 单个模型评估时使用
+--model <model_name>              # HuggingFace model ID
+--dataset gsm8k                   # gsm8k 或 math
+--load_PET_path_1 <path>          # 第一个checkpoint
+--load_PET_path_2 <path>          # 第二个checkpoint
+--output_dir ./results            # 输出目录
 ```
 
-### Mode Connectivity相关
+### 可选参数
 ```bash
---load_PET_path_1 <path>      # 第一个checkpoint
---load_PET_path_2 <path>      # 第二个checkpoint
---itpl_points 11              # 插值点数量（包括端点）
-```
-
-### 数据集相关
-```bash
---dataset gsm8k               # gsm8k 或 math
---max_input_length 512        # 最大输入长度
---max_output_length 512       # 最大输出长度
---eval_batch_size 8           # 评估batch size
-```
-
-### 性能优化
-```bash
---bf16                        # 使用BF16混合精度（推荐）
---cache_dir /path/to/cache    # 模型缓存目录
+--tune_method model               # model(默认), lora, adapter
+--itpl_points 11                  # 插值点数（默认11）
+--max_input_length 512            # 最大输入长度
+--max_output_length 512           # 最大输出长度
+--eval_batch_size 8               # 评估batch size
+--bf16                            # 使用BF16（推荐）
+--cache_dir /path/to/cache        # 模型缓存目录
 ```
 
 ## 输出结果
 
-### Mode Connectivity结果
+### 1. CSV结果文件
 
-CSV文件格式 (`interpolation_results_gsm8k.csv`):
+`interpolation_results_gsm8k.csv`:
 ```csv
 x,metric,performance,loss
 0.0,accuracy,0.42,0.0
 0.1,accuracy,0.41,0.0
 0.2,accuracy,0.40,0.0
-...
+0.3,accuracy,0.39,0.0
+0.4,accuracy,0.38,0.0
+0.5,accuracy,0.39,0.0
+0.6,accuracy,0.40,0.0
+0.7,accuracy,0.41,0.0
+0.8,accuracy,0.42,0.0
+0.9,accuracy,0.42,0.0
 1.0,accuracy,0.43,0.0
 ```
 
-### 可视化图表
+### 2. 可视化图表
 
 自动生成 `interpolation_plot_gsm8k.png`:
-- X轴: 插值系数 (0到1)
-- Y轴: 准确率
-- 红星: 端点（原始模型）
+- **X轴**: 插值系数 (0到1)
+- **Y轴**: 准确率
+- **红星**: 端点（原始模型）
+- **蓝线**: 插值路径
 
-**解读**:
-- 平坦曲线: 强mode connectivity（模型在同一mode）
-- V形曲线: mode之间有barrier
-- 高于端点: beneficial interpolation（罕见）
+### 3. 日志文件
 
-## 实际使用场景
+`interpolation_log.txt`: 包含详细的运行日志
 
-### 场景1: 分析从HuggingFace下载的模型
+## 解读结果
 
-```bash
-# 假设你从HuggingFace下载了两个LoRA checkpoint
-python decoder_interpolation.py \
-  --model Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset gsm8k \
-  --tune_method lora \
-  --load_PET_path_1 ./downloaded/model1_lora.pt \
-  --load_PET_path_2 ./downloaded/model2_lora.pt \
-  --itpl_points 11 \
-  --output_dir ./results
+### Mode Connectivity的含义
+
+**平坦曲线** ✅
+```
+accuracy
+  ^
+  |  ____________________
+  | /                    \
+  |*                      *
+  +-----------------------> x
+  0                       1
+```
+→ **强mode connectivity**: 两个模型在同一个mode中
+
+**V形曲线** ⚠️
+```
+accuracy
+  ^
+  |*                      *
+  | \                    /
+  |  \                  /
+  |   \________________/
+  +-----------------------> x
+  0                       1
+```
+→ **Barrier存在**: 两个模型在不同mode中
+
+**高于端点** 🎉
+```
+accuracy
+  ^
+  |      /\
+  |     /  \
+  |    /    \
+  |*  /      \  *
+  +-----------------------> x
+  0           1
+```
+→ **Beneficial interpolation**: 插值模型优于两个端点（罕见）
+
+## 常见checkpoint格式问题
+
+### Q1: 我的checkpoint格式是什么样的？
+
+**查看方法**:
+```python
+import torch
+
+checkpoint = torch.load('your_checkpoint.pt')
+print("Keys:", checkpoint.keys())
+
+# 如果是嵌套的
+if 'model' in checkpoint:
+    print("Model keys (first 5):", list(checkpoint['model'].keys())[:5])
 ```
 
-### 场景2: 分析RL训练后的模型
+### Q2: 我的checkpoint很大，怎么办？
 
-```bash
-# 使用DAPO/DR GRPO训练得到的checkpoint
-python decoder_interpolation.py \
-  --model Qwen/Qwen2.5-1.5B-Instruct \
-  --dataset gsm8k \
-  --tune_method lora \
-  --load_PET_path_1 ./rl_trained/before_rl.pt \
-  --load_PET_path_2 ./rl_trained/after_rl.pt \
-  --itpl_points 21 \
-  --output_dir ./rl_analysis
+**常见格式**:
+```python
+# 如果你保存时这样做的：
+torch.save({
+    'model': model.state_dict(),
+    'optimizer': optimizer.state_dict(),
+    'epoch': epoch,
+    'loss': loss,
+}, 'checkpoint.pt')
+
+# 代码会自动提取'model'部分！
 ```
 
-### 场景3: 分析不同训练方法
+### Q3: 如何确保checkpoint兼容？
 
-```bash
-# 比较LoRA vs Adapter
-python decoder_interpolation.py \
-  --model Qwen/Qwen2.5-0.5B-Instruct \
-  --dataset math \
-  --tune_method lora \
-  --load_PET_path_1 ./lora_model/checkpoint.pt \
-  --load_PET_path_2 ./adapter_model/checkpoint.pt \
-  --itpl_points 11 \
-  --output_dir ./comparison
-```
+**确保两个checkpoint**:
+1. 来自同一个base model（如都是Qwen2.5-0.5B）
+2. 有相同的参数结构
+3. 都是完整参数或都是同一种PET方法
+
+代码会自动检查参数是否匹配！
+
+## 性能参考
+
+基于DAPO/DR GRPO等论文的结果：
+
+| 模型 | GSM8K | MATH |
+|------|-------|------|
+| Qwen2.5-0.5B | 30-45% | 15-25% |
+| Qwen2.5-1.5B | 50-65% | 25-35% |
+| Qwen2.5-7B | 75-85% | 45-60% |
+
+*实际性能取决于训练方法、数据质量等因素*
 
 ## 代码结构
 
 ```
 Mode-Connectivity-PLM/
 ├── DecoderLLM_model/
-│   ├── decoder_evaluator.py      # 评估器（无训练功能）
-│   ├── modeling_decoder.py       # 模型加载
-│   └── chat_template.py          # Chat template处理 ⚠️ 关键!
+│   ├── decoder_evaluator.py      # 评估器（只评估，无训练）
+│   ├── modeling_decoder.py       # 模型加载（支持full/LoRA/adapter）
+│   └── chat_template.py          # Template处理 ⚠️ 关键!
 │
 ├── dataloader/reasoning/
-│   ├── reasoning_loader.py       # GSM8K, MATH加载
+│   ├── reasoning_loader.py       # GSM8K, MATH加载器
 │   └── reasoning_metrics.py      # 评估指标
 │
-├── decoder_interpolation.py      # Mode connectivity分析
+├── decoder_interpolation.py      # 主脚本：Mode connectivity分析
 ├── evaluate_decoder_llm.py       # 单模型评估
 └── utils/options.py               # 命令行参数
 ```
 
-## 常见问题
+## 故障排除
 
-### Q: 如何处理不同格式的checkpoint?
-
-A: 脚本会自动尝试多种格式。如果遇到问题，可以手动指定：
-
-```python
-# 在Python中手动加载
-import torch
-checkpoint = torch.load('model.pt')
-
-# 查看结构
-print(checkpoint.keys())
-
-# 提取需要的部分
-if 'lora' in checkpoint:
-    weights = checkpoint['lora']
-```
-
-### Q: 模型太大，内存不足怎么办?
-
-A: 使用更小的batch size和混合精度:
+### 内存不足 (OOM)
 
 ```bash
---eval_batch_size 1 \
+# 减小batch size
+--eval_batch_size 1
+
+# 使用混合精度
 --bf16
+
+# 如果还不够，使用更小的模型
+--model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-### Q: 如何使用自己训练的checkpoint?
-
-A: 确保checkpoint格式正确：
+### Checkpoint加载失败
 
 ```python
-# 保存LoRA checkpoint
-torch.save({
-    'lora': model.state_dict()  # 或只保存LoRA参数
-}, 'my_lora_checkpoint.pt')
+# 1. 检查checkpoint内容
+import torch
+ckpt = torch.load('checkpoint.pt')
+print(ckpt.keys())
+
+# 2. 手动提取state dict
+if 'model' in ckpt:
+    state_dict = ckpt['model']
+    torch.save(state_dict, 'clean_checkpoint.pt')
 ```
 
-然后直接使用:
+### 两个checkpoint参数不匹配
+
+确保：
+- 来自同一个base model
+- 参数数量相同
+- 参数名称匹配
+
+脚本会自动只使用共同的参数！
+
+### 模型生成结果不对
+
+检查chat template：
+```python
+from transformers import AutoTokenizer
+from DecoderLLM_model.chat_template import ChatTemplateHandler
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+handler = ChatTemplateHandler("Qwen/Qwen2.5-0.5B-Instruct", tokenizer)
+
+# 测试格式
+print(handler.format_chat("What is 2+2?"))
+```
+
+## 与训练框架的集成
+
+### 从PyTorch Lightning保存的checkpoint
+
+```python
+# PyTorch Lightning格式
+checkpoint = torch.load('checkpoint.ckpt')
+state_dict = checkpoint['state_dict']
+
+# 可能需要移除'model.'前缀
+state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
+
+torch.save(state_dict, 'clean_checkpoint.pt')
+```
+
+### 从HuggingFace Trainer保存的checkpoint
+
+```python
+# HuggingFace格式
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained('./trainer_output')
+torch.save(model.state_dict(), 'checkpoint.pt')
+```
+
+### 从DeepSpeed保存的checkpoint
+
 ```bash
---load_PET_path_1 ./my_lora_checkpoint.pt
+# DeepSpeed会保存多个文件，需要合并
+python zero_to_fp32.py ./deepspeed_output/checkpoint ./merged_checkpoint.pt
 ```
-
-### Q: 支持哪些LoRA框架?
-
-A: 支持：
-- PEFT library (HuggingFace)
-- 手动实现的LoRA
-- 任何保存为state dict的参数
-
-关键是参数命名要包含`lora_A`, `lora_B`等标识。
-
-## 性能参考
-
-基于DAPO/DR GRPO论文的结果：
-
-| 模型 | GSM8K | MATH |
-|------|-------|------|
-| Qwen2.5-0.5B + LoRA | 30-45% | 15-25% |
-| Qwen2.5-1.5B + LoRA | 50-65% | 25-35% |
-| Qwen2.5-7B + LoRA | 75-85% | 45-60% |
 
 ## 参考资料
 

@@ -35,26 +35,48 @@ def load_checkpoint(path, tune_method=None):
     """
     Load checkpoint from path
     Handles different checkpoint formats:
+    - Full model state dict (most common for full parameter training)
     - LoRA weights: {'lora': {...}}
     - Adapter weights: {'adapter': {...}}
-    - Full model: {'model': {...}} or direct state dict
+    - Wrapped model: {'model': {...}} or {'state_dict': {...}}
     """
+    logger = logging.getLogger(__name__)
     checkpoint = torch.load(path, map_location='cpu')
 
-    # Try different keys
-    if tune_method and tune_method in checkpoint:
-        return checkpoint[tune_method]
-    elif 'lora' in checkpoint:
-        return checkpoint['lora']
-    elif 'adapter' in checkpoint:
-        return checkpoint['adapter']
-    elif 'model' in checkpoint:
-        return checkpoint['model']
-    elif 'state_dict' in checkpoint:
-        return checkpoint['state_dict']
-    else:
-        # Assume checkpoint is the state dict itself
+    # Priority order for full model checkpoints
+    # 1. Direct state dict (most common)
+    if all(not key.startswith(('lora', 'adapter', 'model', 'state_dict', 'optimizer', 'scheduler', 'epoch'))
+           for key in checkpoint.keys()):
+        logger.info(f"Loading direct state dict from {path}")
         return checkpoint
+
+    # 2. Wrapped in 'model' or 'state_dict' key
+    if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
+        logger.info(f"Loading from 'model' key in {path}")
+        return checkpoint['model']
+
+    if 'state_dict' in checkpoint and isinstance(checkpoint['state_dict'], dict):
+        logger.info(f"Loading from 'state_dict' key in {path}")
+        return checkpoint['state_dict']
+
+    # 3. Check for PET methods if tune_method is specified
+    if tune_method:
+        if tune_method in checkpoint:
+            logger.info(f"Loading {tune_method} weights from {path}")
+            return checkpoint[tune_method]
+
+    # 4. Try to detect PET automatically
+    if 'lora' in checkpoint:
+        logger.info(f"Detected LoRA weights in {path}")
+        return checkpoint['lora']
+
+    if 'adapter' in checkpoint:
+        logger.info(f"Detected adapter weights in {path}")
+        return checkpoint['adapter']
+
+    # 5. Fallback: assume the whole checkpoint is the state dict
+    logger.warning(f"Could not determine checkpoint format, using entire checkpoint as state dict")
+    return checkpoint
 
 
 def main():

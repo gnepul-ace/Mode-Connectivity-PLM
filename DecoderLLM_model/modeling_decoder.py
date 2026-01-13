@@ -15,8 +15,8 @@ from peft import LoraConfig, get_peft_model, PeftModel
 
 def load_decoder_llm_with_pet(args):
     """
-    Load decoder-only LLM with Parameter-Efficient Tuning
-    Similar to T5 model loading but for causal LMs
+    Load decoder-only LLM (full parameter or with PET)
+    Supports: Full model, LoRA, Adapter
 
     Args:
         args: Arguments with model config
@@ -41,17 +41,26 @@ def load_decoder_llm_with_pet(args):
         trust_remote_code=True,
     )
 
+    # Determine dtype
+    if hasattr(args, 'bf16') and args.bf16:
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+
     # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         config=config,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
+        torch_dtype=dtype,
         device_map=None,  # We'll move to device manually
     )
 
-    # Apply Parameter-Efficient Tuning
-    if args.tune_method == "lora":
+    # Get tune_method (default to "model" for full parameter)
+    tune_method = getattr(args, 'tune_method', 'model')
+
+    # Apply Parameter-Efficient Tuning (optional)
+    if tune_method == "lora":
         # Apply LoRA
         lora_config = LoraConfig(
             r=args.lora_rank if hasattr(args, 'lora_rank') else 8,
